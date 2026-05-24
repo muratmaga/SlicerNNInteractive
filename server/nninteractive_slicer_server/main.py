@@ -19,6 +19,10 @@ from huggingface_hub import (
 )
 
 from nnInteractive.inference.inference_session import nnInteractiveInferenceSession
+from torch.nn.functional import interpolate
+from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
+from nnInteractive.utils.crop import paste_tensor
+from nnunetv2.utilities.helpers import dummy_context, empty_cache
 
 
 from fastapi import FastAPI, Response, UploadFile, File, Form
@@ -30,8 +34,107 @@ from fastapi import FastAPI, Response, UploadFile, File, Form
 REPO_ID = "nnInteractive/nnInteractive"
 MODEL_NAME = "nnInteractive_v1.0"  # Updated models may be available in the future
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), ".nninteractive_weights")
+DEFAULT_MAX_ZOOM_OUT = 4.0  # nnInteractive's hardcoded cap; we make it overridable
 
 app = FastAPI()
+
+
+###############################################################################
+# Subclass with configurable max_zoom_out_factor
+###############################################################################
+# Upstream nnInteractive hardcodes the autozoom cap to 4 in three spots inside
+# _predict. We copy the method to make the cap an instance attribute. This is
+# fragile w.r.t. upstream changes; if nnInteractive's _predict body changes
+# meaningfully, re-sync this override.
+class ConfigurableZoomSession(nnInteractiveInferenceSession):
+    max_zoom_out_factor: float = DEFAULT_MAX_ZOOM_OUT
+
+    def _predict(self, force_full_refine: bool = False):
+        assert self.pad_mode_data == 'constant', 'pad modes other than constant are not implemented here'
+        assert len(self.new_interaction_centers) == len(self.new_interaction_zoom_out_factors)
+        if len(self.new_interaction_centers) == 0:
+            print('No patch queued for prediction. Nothing to do.')
+            return
+
+        if len(self.new_interaction_centers) > 1:
+            print('It seems like more than one interaction was added since the last prediction. This is not '
+                  'recommended and may cause unexpected behavior or inefficient predictions\n'
+                  '!!!WE NO LONGER RUN ONE PREDICTION PER CENTER AND ONLY USE THE LAST ADDED INTERACTION AS CENTER!!!')
+
+        cap = float(self.max_zoom_out_factor)
+        prediction_center = self.new_interaction_centers[-1]
+        zoom_out_factor = min(cap, self.new_interaction_zoom_out_factors[-1])
+
+        start_predict = time.time()
+        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            start_initial_pred = time.time()
+            input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
+            pred = self.network(input_for_predict[None])[0].argmax(0).detach()
+            del input_for_predict
+
+            previous_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox)
+            if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
+                previous_prediction = interpolate(
+                    previous_prediction[None, None].to(float), pred.shape, mode='nearest'
+                )[0, 0]
+            has_change = self._detect_change_at_border(pred, previous_prediction)
+            del previous_prediction
+
+            print(f'Took {round(time.time() - start_initial_pred, 3)} s for initial prediction at zoom out factor {zoom_out_factor}')
+
+            zoom_out_growth_factor = 1.5
+            start_zoomout = time.time()
+            while has_change and self.do_autozoom:
+                print(f'AutoZoom zoom out factor {zoom_out_factor} (cap {cap})')
+                if zoom_out_factor >= cap:
+                    break
+                zoom_out_factor *= zoom_out_growth_factor
+                zoom_out_factor = min(cap, zoom_out_factor)
+
+                input_for_predict, scaled_patch_size, scaled_bbox = self._build_network_input(prediction_center, zoom_out_factor)
+                pred = self.network(input_for_predict[None])[0].argmax(0).detach()
+                del input_for_predict
+
+                previous_prediction = crop_and_pad_nd(self.interactions[0], scaled_bbox)
+                if not all([i == j for i, j in zip(pred.shape, previous_prediction.shape)]):
+                    previous_prediction_resized = interpolate(
+                        previous_prediction[None, None].to(float), pred.shape, mode='nearest'
+                    )[0, 0]
+                else:
+                    previous_prediction_resized = previous_prediction
+                has_change = self._detect_change_at_border(pred, previous_prediction_resized)
+
+            if zoom_out_factor > 1:
+                print(f'Zoom out took {round(time.time() - start_zoomout, 3)} s, max zoom out factor {zoom_out_factor}')
+            else:
+                print('No zoom out necessary')
+
+            if zoom_out_factor == 1:
+                paste_tensor(self.interactions[0], pred.half(), scaled_bbox)
+                bbox = [[i[0] + bbc[0], i[1] + bbc[0]] for i, bbc in
+                        zip(scaled_bbox, self.preprocessed_props['bbox_used_for_cropping'])]
+                paste_tensor(
+                    self.target_buffer,
+                    pred.to(self.target_buffer.device) if isinstance(self.target_buffer, torch.Tensor) else pred.to('cpu'),
+                    bbox,
+                )
+                print('No refinement necessary')
+            else:
+                prediction_with_coarse = self.interactions[0]
+                if not all([i == j for i, j in zip(pred.shape, scaled_patch_size)]):
+                    pred = (interpolate(pred[None, None].to(float), scaled_patch_size, mode='trilinear')[0, 0] >= 0.5).to(torch.uint8)
+                diff_map, has_diff = self._compute_diff_map(pred, self.interactions[0], scaled_bbox, scaled_patch_size)
+                if force_full_refine:
+                    print('Forcing full refinement of entire structure')
+                    diff_map[self.interactions[0] > 0] = 1
+                paste_tensor(prediction_with_coarse, pred, scaled_bbox)
+                self._refine_coarse(diff_map, prediction_with_coarse)
+                del prediction_with_coarse
+
+        print(f'Done. Total time {round(time.time() - start_predict, 3)}s')
+        self.new_interaction_centers = []
+        self.new_interaction_zoom_out_factors = []
+        empty_cache(self.device)
 
 ###############################################################################
 # Utility / helper functions
@@ -83,23 +186,23 @@ def segmentation_binary(seg_in, compress=False):
 
 def process_mask_and_click_input(file_bytes, positive_click):
     """
-    Helper that decompresses file_bytes, loads the numpy mask, and interprets
-    the positive_click string as a boolean.
+    Helper that loads the numpy mask (auto-decompressing if gzip-framed) and
+    interprets the positive_click string as a boolean. Accepts both gzip
+    (magic 0x1f 0x8b) and raw npy so updated and legacy clients both work.
     """
     positive_click_bool = positive_click.lower() in ["true", "1", "yes"]
-    t = time.time()
 
     error = get_error_if_img_not_set()
     if error is not None:
         return error
 
-    try:
-        decompressed = gzip.decompress(file_bytes)
-    except Exception as e:
-        return {"status": "error", "message": f"Decompression failed: {e}"}
+    if len(file_bytes) >= 2 and file_bytes[:2] == b"\x1f\x8b":
+        try:
+            file_bytes = gzip.decompress(file_bytes)
+        except Exception as e:
+            return {"status": "error", "message": f"Decompression failed: {e}"}
 
-    # Load the numpy mask.
-    mask = np.load(io.BytesIO(decompressed))
+    mask = np.load(io.BytesIO(file_bytes))
 
     return mask, positive_click_bool
 
@@ -140,7 +243,7 @@ class PromptManager:
         """
         Creates an nnInteractiveInferenceSession, points it at the downloaded model.
         """
-        session = nnInteractiveInferenceSession(
+        session = ConfigurableZoomSession(
             device=torch.device("cuda:0"),  # Set inference device
             use_torch_compile=False,  # Experimental: Not tested yet
             verbose=True,
@@ -155,11 +258,18 @@ class PromptManager:
 
         return session
 
-    def set_image(self, input_image):
+    def set_image(self, input_image, max_zoom_out_factor=None):
         """
         Loads the user-provided 3D image into the session, resets interactions.
+        Optionally overrides the autozoom cap for this image.
         """
         self.session.reset_interactions()
+
+        if max_zoom_out_factor is not None and max_zoom_out_factor > 0:
+            self.session.max_zoom_out_factor = float(max_zoom_out_factor)
+        else:
+            self.session.max_zoom_out_factor = DEFAULT_MAX_ZOOM_OUT
+        print(f"Session max_zoom_out_factor set to {self.session.max_zoom_out_factor}")
 
         self.img = input_image[None]  # Ensure shape (1, x, y, z)
         self.session.set_image(self.img)
@@ -266,13 +376,15 @@ async def startup_event():
 @app.post("/upload_image")
 async def upload_image(
     file: UploadFile = File(None),
+    max_zoom_out_factor: float = Form(None),
 ):
     """
     Receive a npy file from the client and set it as the main image in PromptManager.
+    Optionally accept max_zoom_out_factor as a form field to override the autozoom cap.
     """
     file_bytes = await file.read()
     arr = np.load(io.BytesIO(file_bytes))
-    PROMPT_MANAGER.set_image(arr)
+    PROMPT_MANAGER.set_image(arr, max_zoom_out_factor=max_zoom_out_factor)
 
     return {"status": "ok"}
 
@@ -282,15 +394,19 @@ async def upload_segment(
     file: UploadFile = File(None),
 ):
     """
-    Receive a gzipped npy file from the client and set it as the segmentation in PromptManager.
+    Receive an npy file from the client and set it as the segmentation in PromptManager.
+    Accepts both gzip-compressed and raw npy (auto-detected via magic bytes) so
+    clients that still send gzip continue to work.
     """
     error = get_error_if_img_not_set()
     if error is not None:
         return error
-    
+
     file_bytes = await file.read()
-    decompressed = gzip.decompress(file_bytes)
-    arr = np.load(io.BytesIO(decompressed))
+    # gzip magic bytes are 0x1f 0x8b; npy magic starts with 0x93 'N' 'U' 'M' 'P' 'Y'.
+    if len(file_bytes) >= 2 and file_bytes[:2] == b"\x1f\x8b":
+        file_bytes = gzip.decompress(file_bytes)
+    arr = np.load(io.BytesIO(file_bytes))
 
     PROMPT_MANAGER.set_segment(arr)
     return {"status": "ok"}
@@ -318,13 +434,12 @@ async def add_point_interaction(params: PointParams):
     seg_result = PROMPT_MANAGER.add_point_interaction(
         point_coordinates=params.voxel_coord, include_interaction=params.positive_click
     )
-    compressed_bin = segmentation_binary(seg_result, compress=True)
+    compressed_bin = segmentation_binary(seg_result, compress=False)
     print(f"Server whole infer function time: {time.time() - t}")
 
     return Response(
         content=compressed_bin,
         media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
     )
 
 
@@ -354,13 +469,12 @@ async def add_bbox_interaction(params: BBoxParams):
         include_interaction=params.positive_click,
     )
 
-    segmentation_binary_data = segmentation_binary(seg_result, compress=True)
+    segmentation_binary_data = segmentation_binary(seg_result, compress=False)
     print(f"Server whole infer function time: {time.time() - t}")
 
     return Response(
         content=segmentation_binary_data,
         media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
     )
 
 
@@ -389,12 +503,11 @@ async def add_lasso_interaction(
     )
 
     # Convert the segmentation result to compressed binary data.
-    segmentation_binary_data = segmentation_binary(seg_result, compress=True)
+    segmentation_binary_data = segmentation_binary(seg_result, compress=False)
 
     return Response(
         content=segmentation_binary_data,
         media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
     )
 
 
@@ -422,12 +535,11 @@ async def add_scribble_interaction(
     )
 
     # Convert the segmentation result to compressed binary data.
-    segmentation_binary_data = segmentation_binary(seg_result, compress=True)
+    segmentation_binary_data = segmentation_binary(seg_result, compress=False)
 
     return Response(
         content=segmentation_binary_data,
         media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
     )
 
 

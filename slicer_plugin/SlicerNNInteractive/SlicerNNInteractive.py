@@ -28,6 +28,32 @@ from PythonQt.QtGui import QMessageBox
 
 
 ###############################################################################
+# Constants for large-volume dynamic-ROI mode
+###############################################################################
+# Total upload voxel budget: a 512^3 ≈ 134M-voxel cube. This is the GPU VRAM
+# budget — at 4 bytes per float32 voxel plus the model's autozoom replicas,
+# this keeps the server inside ~16 GB even on modest GPUs. The crop window is
+# allocated against this budget anisotropically, matching the data's shape.
+ROI_BUDGET_VOXEL_CUBE = 512
+# If True, always use ROI mode regardless of the size heuristic. For testing.
+FORCE_ROI_MODE = False
+# Auto-enable ROI mode when the volume exceeds this many voxels (I*J*K).
+# The threshold is comfortably above the budget so volumes that fit natively
+# don't get cropped unnecessarily.
+ROI_AUTO_ENABLE_VOXEL_THRESHOLD = 1_000_000_000
+# Reference physical voxel spacing the nnInteractive checkpoint was trained on.
+# Used to compute max_zoom_out_factor from the data's spacing.
+ROI_REFERENCE_SPACING_MM = 1.0
+# Upper bound for the auto-computed max_zoom_out_factor.
+ROI_MAX_ZOOM_OUT_FACTOR_CAP = 64.0
+# Fraction of the crop window that counts as the "comfort zone". A new prompt
+# inside the central ROI_COMFORT_FRACTION × window reuses the existing crop;
+# otherwise the crop window recenters and re-uploads. 2/3 gives ~1/6 of the
+# window on each side as headroom for the model to expand the segmentation.
+ROI_COMFORT_FRACTION = 2.0 / 3.0
+
+
+###############################################################################
 # SlicerNNInteractive
 ###############################################################################
 
@@ -93,14 +119,27 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                         return
 
             failed_to_sync = False
+            image_was_uploaded = False
 
             if self.image_changed():
                 logging.debug("Image changed (or not previously set). Calling upload_image_to_server()")
+                if self._roi_active:
+                    slicer.util.showStatusMessage(
+                        f"nnInteractive: cropping window {self._roi_shape_ijk} and uploading...", 0)
+                else:
+                    slicer.util.showStatusMessage("nnInteractive: uploading full volume...", 0)
+                slicer.app.processEvents()
                 result = self.upload_image_to_server()
                 failed_to_sync = result is None
+                image_was_uploaded = not failed_to_sync
 
-            if not failed_to_sync and self.selected_segment_changed():
-                logging.debug("Segment changed (or not previously set). Calling upload_segment_to_server()")
+            # Image upload resets server-side interactions, so the segment must
+            # follow the image whenever the image was just (re)uploaded. In ROI
+            # mode this also ensures the freshly cropped segment is in sync.
+            if not failed_to_sync and (image_was_uploaded or self.selected_segment_changed()):
+                logging.debug("Calling upload_segment_to_server() (image_was_uploaded=%s)", image_was_uploaded)
+                slicer.util.showStatusMessage("nnInteractive: uploading segment...", 0)
+                slicer.app.processEvents()
                 self.remove_all_but_last_prompt()
                 result = self.upload_segment_to_server()
                 failed_to_sync = result is None
@@ -108,7 +147,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 logging.debug("Segment did not change!")
 
             if not failed_to_sync:
-                return func(self, *args, **kwargs)
+                slicer.util.showStatusMessage("nnInteractive: running inference...", 0)
+                slicer.app.processEvents()
+                try:
+                    return func(self, *args, **kwargs)
+                finally:
+                    slicer.util.showStatusMessage("", 0)
 
         return inner
 
@@ -128,6 +172,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._server_log_buffer = []
         self._server_log_threads = []
         self._server_log_timer = None
+
+        # Large-volume dynamic-ROI state.
+        # When _roi_active, prompts and image/segment uploads are restricted to
+        # a native-resolution crop window around each prompt; server responses
+        # are pasted back into the full-volume segment at the same crop offset.
+        # No downsampling — the window shape is sized against ROI_BUDGET_VOXEL_CUBE^3
+        # to preserve the data's aspect ratio.
+        self._roi_active = False
+        self._roi_start_ijk = None       # (i, j, k) start in original volume IJK
+        self._roi_shape_ijk = None       # (di, dj, dk) extent in original volume IJK
+        # User override for max_zoom_out_factor; None means auto-compute from spacing.
+        self._roi_max_zoom_out_factor_override = None
 
     def setup(self):
         """
@@ -267,6 +323,160 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             lambda: self.ui.serverOutputTextEdit.clear()
         )
         self._init_server_log_polling()
+
+        self._build_roi_mode_ui()
+
+    def _build_roi_mode_ui(self):
+        """Insert a 'Large-volume mode' groupbox into the Configuration tab,
+        between Server Settings and Server output. Shows clearly whether
+        large-volume mode is on/off for the next prompt, and lets the user
+        override the auto-computed max_zoom_out_factor."""
+        try:
+            config_layout = self.ui.serverGroup.parent().layout()
+            if config_layout is None:
+                return
+
+            group = qt.QGroupBox("Large-volume mode")
+            vbox = qt.QVBoxLayout(group)
+
+            self.ui_roiModeBadge = qt.QLabel("MODE: …")
+            badge_font = qt.QFont()
+            badge_font.setBold(True)
+            badge_font.setPointSize(13)
+            self.ui_roiModeBadge.setFont(badge_font)
+            vbox.addWidget(self.ui_roiModeBadge)
+
+            self.ui_roiReasonLabel = qt.QLabel("")
+            self.ui_roiReasonLabel.setWordWrap(True)
+            vbox.addWidget(self.ui_roiReasonLabel)
+
+            self.ui_roiDetailsLabel = qt.QLabel("")
+            self.ui_roiDetailsLabel.setWordWrap(True)
+            self.ui_roiDetailsLabel.setStyleSheet("color: #555; font-family: monospace;")
+            vbox.addWidget(self.ui_roiDetailsLabel)
+
+            row1 = qt.QHBoxLayout()
+            row1.addWidget(qt.QLabel("Max zoom-out factor:"))
+            self.ui_zoomFactorSpin = qt.QDoubleSpinBox()
+            self.ui_zoomFactorSpin.setDecimals(1)
+            self.ui_zoomFactorSpin.setSingleStep(1.0)
+            self.ui_zoomFactorSpin.setRange(0.0, ROI_MAX_ZOOM_OUT_FACTOR_CAP)
+            self.ui_zoomFactorSpin.setValue(0.0)  # 0 = auto
+            self.ui_zoomFactorSpin.setToolTip(
+                "0 = auto (computed from voxel spacing). "
+                "Set to a positive number to override."
+            )
+            self.ui_zoomFactorSpin.valueChanged.connect(self._on_zoom_factor_override_changed)
+            row1.addWidget(self.ui_zoomFactorSpin)
+            self.ui_zoomFactorAutoLabel = qt.QLabel("")
+            row1.addWidget(self.ui_zoomFactorAutoLabel)
+            row1.addStretch(1)
+            vbox.addLayout(row1)
+
+            self.ui_roiRefreshButton = qt.QPushButton("Refresh from current volume")
+            self.ui_roiRefreshButton.setToolTip(
+                "Recompute the mode badge from the currently selected volume."
+            )
+            self.ui_roiRefreshButton.clicked.connect(self._refresh_roi_status_label)
+            vbox.addWidget(self.ui_roiRefreshButton)
+
+            # Insert just before the Server output group
+            insert_at = config_layout.count()
+            for i in range(config_layout.count()):
+                w = config_layout.itemAt(i).widget()
+                if w is not None and w.objectName == "serverOutputGroup":
+                    insert_at = i
+                    break
+            config_layout.insertWidget(insert_at, group)
+
+            self._refresh_roi_status_label()
+        except Exception as e:
+            logging.debug(f"Failed to build ROI mode UI: {e}")
+
+    def _on_zoom_factor_override_changed(self, value):
+        if value <= 0.0:
+            self._roi_max_zoom_out_factor_override = None
+        else:
+            self._roi_max_zoom_out_factor_override = float(value)
+        self._refresh_roi_status_label()
+
+    def _refresh_roi_status_label(self):
+        """Compute and display the large-volume mode status. Reflects the
+        active ROI when one has been established, otherwise previews what
+        will happen on the next prompt based on the current volume."""
+        if not hasattr(self, "ui_roiModeBadge"):
+            return
+
+        spacing = self._volume_spacing_mm()
+        vol_ijk = self._volume_shape_ijk()
+        will_be_on = self._should_use_roi_mode()
+
+        # Badge
+        if will_be_on:
+            self.ui_roiModeBadge.setText("MODE: ON  (large-volume / ROI)")
+            self.ui_roiModeBadge.setStyleSheet(
+                "color: white; background-color: #2e8b57; padding: 4px 8px; border-radius: 3px;"
+            )
+        else:
+            self.ui_roiModeBadge.setText("MODE: OFF  (full volume sent as-is)")
+            self.ui_roiModeBadge.setStyleSheet(
+                "color: white; background-color: #888; padding: 4px 8px; border-radius: 3px;"
+            )
+
+        # Reason — short, factual, voxel-count based.
+        if vol_ijk is None:
+            self.ui_roiReasonLabel.setText("No volume selected yet.")
+        else:
+            total = int(vol_ijk[0]) * int(vol_ijk[1]) * int(vol_ijk[2])
+            gv = total / 1e9
+            thresh_gv = ROI_AUTO_ENABLE_VOXEL_THRESHOLD / 1e9
+            if FORCE_ROI_MODE:
+                self.ui_roiReasonLabel.setText(
+                    f"FORCE_ROI_MODE is True (override). Volume size: {gv:.3f} GV."
+                )
+            elif will_be_on:
+                self.ui_roiReasonLabel.setText(
+                    f"Volume size: {gv:.3f} GV  (> {thresh_gv:g} GV threshold)."
+                )
+            else:
+                self.ui_roiReasonLabel.setText(
+                    f"Volume size: {gv:.3f} GV  (≤ {thresh_gv:g} GV threshold)."
+                )
+
+        # Details: actual crop window if active, otherwise preview of what
+        # would happen. Native resolution throughout — no downsampling.
+        if self._roi_active and self._roi_start_ijk is not None:
+            mzof = self._compute_max_zoom_out_factor()
+            self.ui_roiDetailsLabel.setText(
+                f"Crop window active:  start_ijk={self._roi_start_ijk}\n"
+                f"                     shape_ijk={self._roi_shape_ijk}  (native res)\n"
+                f"                     zoom-out={mzof}"
+            )
+        elif will_be_on and vol_ijk is not None:
+            shape = self._compute_window_shape()
+            mzof = self._compute_max_zoom_out_factor()
+            if shape is not None:
+                self.ui_roiDetailsLabel.setText(
+                    f"Preview (no prompt yet):  window_ijk≈{shape}  (native res)\n"
+                    f"                          zoom-out≈{mzof}"
+                )
+            else:
+                self.ui_roiDetailsLabel.setText("")
+        elif vol_ijk is not None:
+            self.ui_roiDetailsLabel.setText(
+                f"Volume shape (I,J,K) = {vol_ijk}, spacing = "
+                f"{tuple(round(s, 4) for s in spacing) if spacing else '?'} mm"
+            )
+        else:
+            self.ui_roiDetailsLabel.setText("")
+
+        # Auto-zoom-factor hint
+        if hasattr(self, "ui_zoomFactorAutoLabel"):
+            mzof = self._compute_max_zoom_out_factor()
+            if self._roi_max_zoom_out_factor_override is None and mzof is not None:
+                self.ui_zoomFactorAutoLabel.setText(f"(auto = {mzof})")
+            else:
+                self.ui_zoomFactorAutoLabel.setText("(override)")
 
     def on_server_mode_changed(self, internal_selected):
 
@@ -897,19 +1107,25 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
                 self.point_prompt(xyz=xyz, positive_click=self.is_positive)
 
-    @ensure_synched
     def point_prompt(self, xyz=None, positive_click=False):
-        """
-        Uploads point prompt to the server.
-        """
+        """Public entry: decide ROI placement, then send the prompt."""
+        if xyz is not None:
+            self._maybe_update_roi_for_prompt(tuple(xyz))
+        self._send_point_prompt(xyz=xyz, positive_click=positive_click)
+
+    @ensure_synched
+    def _send_point_prompt(self, xyz=None, positive_click=False):
+        """Uploads point prompt to the server. ROI must already be set up."""
         url = f"{self.server}/add_point_interaction"
 
+        send_xyz = self._ijk_to_roi_local(xyz) if self._roi_active else tuple(xyz)
         seg_response = self.request_to_server(
-            url, json={"voxel_coord": xyz[::-1], "positive_click": positive_click}
+            url, json={"voxel_coord": list(send_xyz)[::-1], "positive_click": positive_click}
         )
 
+        expected_shape = self._expected_server_shape()
         unpacked_segmentation = self.unpack_binary_segmentation(
-            seg_response.content, decompress=False
+            seg_response.content, decompress=False, vol_shape=expected_shape
         )
         logging.debug(f"unpacked_segmentation.sum(): {unpacked_segmentation.sum()}")
         logging.debug(seg_response)
@@ -964,24 +1180,46 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.prev_caller = caller
 
-    @ensure_synched
     def bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False):
-        """
-        Uploads BBox prompt to the server.
-        """
+        """Public entry: anchor ROI on bbox center, then send."""
+        center = tuple((outer_point_one[a] + outer_point_two[a]) // 2 for a in range(3))
+        self._maybe_update_roi_for_prompt(center)
+        self._send_bbox_prompt(
+            outer_point_one=outer_point_one,
+            outer_point_two=outer_point_two,
+            positive_click=positive_click,
+        )
+
+    @ensure_synched
+    def _send_bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False):
+        """Uploads BBox prompt. ROI-spanning bboxes are silently clipped to fit."""
         url = f"{self.server}/add_bbox_interaction"
+
+        if self._roi_active:
+            p1 = self._ijk_to_roi_local(outer_point_one)
+            p2 = self._ijk_to_roi_local(outer_point_two)
+            roi_shape_kji = self._expected_server_shape()  # native (K, J, I)
+            if roi_shape_kji is not None:
+                # Clip both points to the ROI-local native extent (IJK order)
+                max_ijk = tuple(roi_shape_kji[::-1])  # (I, J, K)
+                p1 = tuple(max(0, min(p1[a], max_ijk[a] - 1)) for a in range(3))
+                p2 = tuple(max(0, min(p2[a], max_ijk[a] - 1)) for a in range(3))
+        else:
+            p1 = tuple(outer_point_one)
+            p2 = tuple(outer_point_two)
 
         seg_response = self.request_to_server(
             url,
             json={
-                "outer_point_one": outer_point_one[::-1],
-                "outer_point_two": outer_point_two[::-1],
+                "outer_point_one": list(p1)[::-1],
+                "outer_point_two": list(p2)[::-1],
                 "positive_click": positive_click,
             },
         )
 
+        expected_shape = self._expected_server_shape()
         unpacked_segmentation = self.unpack_binary_segmentation(
-            seg_response.content, decompress=False
+            seg_response.content, decompress=False, vol_shape=expected_shape
         )
         self.show_segmentation(unpacked_segmentation)
 
@@ -1088,41 +1326,73 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     #
     #  -- Lasso/scribble
     #
-    @ensure_synched
     def lasso_or_scribble_prompt(self, mask, positive_click=False, tp="lasso"):
-        """
-        Uploads lasso or scribble prompt to the server.
-        """
-        if np.sum(mask) == 0:
-            return
-        
+        """Public entry: anchor ROI on mask bbox center, then send.
+        Bbox center via axis projections is much cheaper than np.argwhere().mean()
+        on a multi-GB mask — no per-voxel coord array allocation, and the per-axis
+        np.any() reductions short-circuit per voxel."""
+        center_ijk = self._mask_bbox_center_ijk(mask)
+        if center_ijk is None:
+            return  # mask is empty
+        self._maybe_update_roi_for_prompt(center_ijk)
+        self._send_lasso_or_scribble_prompt(mask=mask, positive_click=positive_click, tp=tp)
+
+    @staticmethod
+    def _mask_bbox_center_ijk(mask):
+        """Returns (i, j, k) center of the mask's non-zero bounding box,
+        or None if the mask is empty. Mask is (K, J, I) numpy."""
+        centers_kji = []
+        for axis in range(3):
+            other_axes = tuple(a for a in range(3) if a != axis)
+            proj = mask.any(axis=other_axes)
+            nz = np.where(proj)[0]
+            if len(nz) == 0:
+                return None
+            centers_kji.append(int((int(nz[0]) + int(nz[-1])) // 2))
+        return (centers_kji[2], centers_kji[1], centers_kji[0])  # KJI -> IJK
+
+    @ensure_synched
+    def _send_lasso_or_scribble_prompt(self, mask, positive_click=False, tp="lasso"):
+        """Uploads lasso or scribble prompt. In ROI mode, crops the mask to the
+        window. Skips gzip (server auto-detects), zero-copies bool to uint8,
+        skips the redundant empty check (already done by the public entry)."""
+        # bool -> uint8 is zero-copy via view; uint8 stays put; anything else falls
+        # back to astype.
+        if mask.dtype == np.bool_:
+            mask_u8 = mask.view(np.uint8)
+        elif mask.dtype == np.uint8:
+            mask_u8 = mask
+        else:
+            mask_u8 = mask.astype(np.uint8)
+
+        if self._roi_active:
+            send_mask = self._crop_for_roi(mask_u8)
+        else:
+            send_mask = mask_u8
+
         url = f"{self.server}/add_{tp}_interaction"
         try:
             buffer = io.BytesIO()
-            np.save(buffer, mask)
-            compressed_data = gzip.compress(buffer.getvalue())
+            np.save(buffer, send_mask)
+            raw_data = buffer.getvalue()
 
             from requests_toolbelt import MultipartEncoder
 
             fields = {
-                "file": ("volume.npy.gz", compressed_data, "application/octet-stream"),
-                "positive_click": str(
-                    positive_click
-                ),  # Make sure to send it as a string.
+                "file": ("volume.npy", raw_data, "application/octet-stream"),
+                "positive_click": str(positive_click),
             }
             encoder = MultipartEncoder(fields=fields)
             seg_response = self.request_to_server(
                 url,
                 data=encoder,
-                headers={
-                    "Content-Type": encoder.content_type,
-                    "Content-Encoding": "gzip",
-                },
+                headers={"Content-Type": encoder.content_type},
             )
 
             if seg_response.status_code == 200:
+                expected_shape = self._expected_server_shape()
                 unpacked_segmentation = self.unpack_binary_segmentation(
-                    seg_response.content, decompress=False
+                    seg_response.content, decompress=False, vol_shape=expected_shape
                 )
                 self.show_segmentation(unpacked_segmentation)
             else:
@@ -1151,15 +1421,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.scribble_segment_node, label_name, self.get_volume_node()
         )
 
-        if (
-            hasattr(self, "_prev_scribble_mask")
-            and self._prev_scribble_mask is not None
-        ):
-            prev_scribble_mask = self._prev_scribble_mask
+        prev_scribble_mask = getattr(self, "_prev_scribble_mask", None)
+        if prev_scribble_mask is None:
+            # First scribble of the session — no diff, no need to allocate zeros.
+            diff_mask = mask
         else:
-            prev_scribble_mask = mask * 0
-
-        diff_mask = mask - prev_scribble_mask
+            diff_mask = mask - prev_scribble_mask
         self._prev_scribble_mask = mask
 
         with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
@@ -1182,7 +1449,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # After creating a new segment, negative prompts do not make sense, so
         # we're automatically switching the prompt type to positive.
         self.ui.pbPromptTypePositive.click()
-        
+        # Fresh segment = fresh ROI session: next prompt picks a new window.
+        self._reset_roi()
+
         logging.debug("doing make_new_segment")
         segmentation_node = self.get_segmentation_node()
 
@@ -1220,7 +1489,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # After clearing a segment, negative prompts do not make sense, so
         # we're automatically switching the prompt type to positive.
         self.ui.pbPromptTypePositive.click()
-        
+        # Cleared segment = fresh ROI session.
+        self._reset_roi()
+
         _, selected_segment_id = self.get_selected_segmentation_node_and_segment_id()
 
         if selected_segment_id:
@@ -1236,9 +1507,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def show_segmentation(self, segmentation_mask):
         """
         Updates the currently selected segment with the given binary mask array.
+        In ROI mode, segmentation_mask is the native-resolution crop returned by
+        the server; we paste it back into the full-volume segment at the crop
+        offset (REPLACE within the crop window, untouched outside).
         """
         t0 = time.time()
-        self.previous_states["segment_data"] = segmentation_mask
+        if self._roi_active and self._roi_shape_ijk is not None:
+            expected_shape = self._expected_server_shape()
+            if expected_shape is not None and segmentation_mask.shape == expected_shape:
+                segmentation_mask = self._composite_roi_mask_into_full(segmentation_mask)
+            else:
+                logging.warning(
+                    f"ROI mask shape {segmentation_mask.shape} != expected {expected_shape}; "
+                    "writing as-is."
+                )
 
         segmentationNode, selectedSegmentID = (
             self.get_selected_segmentation_node_and_segment_id()
@@ -1269,8 +1551,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # If we do this when segmentation_mask.sum() == 0, sometimes Slicer will throw "bogus" OOM errors
             # (see https://github.com/coendevente/SlicerNNInteractive/issues/38)
             segmentationNode.GetSegmentation().CollapseBinaryLabelmaps()
-        
+
         del segmentation_mask
+
+        # Refresh segment signature so the next selected_segment_changed call
+        # doesn't see this server-driven write as a user edit and re-upload.
+        self.previous_states["segment_sig"] = (
+            id(segmentationNode), selectedSegmentID, int(segmentationNode.GetMTime())
+        )
 
         logging.debug(f"show_segmentation took {time.time() - t0}")
 
@@ -1339,24 +1627,211 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def selected_segment_changed(self):
         """
-        Checks if the current segment mask has changed from our `self.previous_states`.
+        Returns True when the server needs the segment re-uploaded. O(1)
+        signature: (segmentation node identity, selected segment id, VTK MTime).
+        Updated by show_segmentation after each server-driven write so we don't
+        falsely flag the just-written-back mask as a user edit on the next prompt.
         """
-        segment_data = self.get_segment_data()
-        old_segment_data = self.previous_states.get("segment_data", None)
-        selected_segment_changed = old_segment_data is None or not np.array_equal(
-            old_segment_data.astype(bool), segment_data.astype(bool)
+        seg_node = self.get_segmentation_node()
+        seg_id = self.get_current_segment_id()
+        if seg_node is None or not seg_id:
+            return False
+        sig = (id(seg_node), seg_id, int(seg_node.GetMTime()))
+        last_sig = self.previous_states.get("segment_sig", None)
+        changed = last_sig != sig
+        self.previous_states["segment_sig"] = sig
+        logging.debug(f"selected_segment_changed: {changed}  sig={sig}")
+        return changed
+
+    ###############################################################################
+    # Dynamic-ROI helpers (large-volume mode)
+    ###############################################################################
+
+    def _volume_spacing_mm(self):
+        """Returns (s_i, s_j, s_k) voxel spacing in mm, or None if no volume."""
+        vn = self.get_volume_node()
+        if vn is None:
+            return None
+        return tuple(float(s) for s in vn.GetSpacing())
+
+    def _volume_shape_ijk(self):
+        """Returns (I, J, K) shape of the current volume, or None."""
+        arr = self.get_image_data()
+        if arr is None:
+            return None
+        # numpy array is (K, J, I)
+        return tuple(arr.shape[::-1])
+
+    def _should_use_roi_mode(self):
+        """Enable when total voxel count exceeds ROI_AUTO_ENABLE_VOXEL_THRESHOLD.
+        Above ~1 gigavoxel the server's float32 representation + autozoom
+        replicas blow past a 16 GB GPU."""
+        if FORCE_ROI_MODE:
+            return True
+        vol_ijk = self._volume_shape_ijk()
+        if vol_ijk is None:
+            return False
+        total = int(vol_ijk[0]) * int(vol_ijk[1]) * int(vol_ijk[2])
+        return total > ROI_AUTO_ENABLE_VOXEL_THRESHOLD
+
+    def _compute_window_shape(self):
+        """Aspect-preserving crop window sized to ROI_BUDGET_VOXEL_CUBE^3 voxels.
+        Each axis gets vol_axis × k where k = (BUDGET / prod(vol))^(1/3),
+        clamped to vol_axis. Returns shape_ijk."""
+        vol_ijk = self._volume_shape_ijk()
+        if vol_ijk is None:
+            return None
+        prod = int(vol_ijk[0]) * int(vol_ijk[1]) * int(vol_ijk[2])
+        budget = ROI_BUDGET_VOXEL_CUBE ** 3
+        k = (budget / prod) ** (1.0 / 3.0)
+        shape = tuple(
+            min(vol_ijk[a], max(1, int(round(vol_ijk[a] * k))))
+            for a in range(3)
         )
+        return shape
 
-        logging.debug(f"segment_data.sum(): {segment_data.sum()}")
+    def _compute_roi_for_center(self, center_ijk):
+        """Center the crop window on the given IJK point, clipped to volume
+        bounds. Returns (start_ijk, shape_ijk)."""
+        vol_ijk = self._volume_shape_ijk()
+        if vol_ijk is None:
+            return None
+        shape_ijk = self._compute_window_shape()
+        if shape_ijk is None:
+            return None
+        start_ijk = []
+        for axis in range(3):
+            extent = shape_ijk[axis]
+            half = extent // 2
+            start = int(center_ijk[axis]) - half
+            if start < 0:
+                start = 0
+            if start + extent > vol_ijk[axis]:
+                start = vol_ijk[axis] - extent
+            if start < 0:
+                start = 0
+            start_ijk.append(int(start))
+        return tuple(start_ijk), tuple(shape_ijk)
 
-        if old_segment_data is not None:
-            logging.debug(f"old_segment_data.sum(): {old_segment_data.sum()}")
-        else:
-            logging.debug("old_segment_data is None")
+    def _in_current_roi(self, ijk):
+        """True if ijk is anywhere inside the current crop window."""
+        if not self._roi_active or self._roi_start_ijk is None:
+            return False
+        for axis in range(3):
+            if ijk[axis] < self._roi_start_ijk[axis]:
+                return False
+            if ijk[axis] >= self._roi_start_ijk[axis] + self._roi_shape_ijk[axis]:
+                return False
+        return True
 
-        logging.debug(f"selected_segment_changed: {selected_segment_changed}")
+    def _in_comfort_zone(self, ijk):
+        """True if ijk falls in the central ROI_COMFORT_FRACTION of the crop
+        window — the margin from each face is window_size × (1 - frac) / 2.
+        Outside this zone we recenter so the model always has headroom."""
+        if not self._roi_active or self._roi_start_ijk is None:
+            return False
+        for axis in range(3):
+            size = self._roi_shape_ijk[axis]
+            margin = int(size * (1.0 - ROI_COMFORT_FRACTION) / 2.0)
+            lo = self._roi_start_ijk[axis] + margin
+            hi = self._roi_start_ijk[axis] + size - margin
+            if ijk[axis] < lo or ijk[axis] >= hi:
+                return False
+        return True
 
-        return selected_segment_changed
+    def _ijk_to_roi_local(self, ijk):
+        """Translate an IJK in the original volume to ROI-local IJK (native)."""
+        if not self._roi_active:
+            return tuple(int(v) for v in ijk)
+        return tuple(int(ijk[a] - self._roi_start_ijk[a]) for a in range(3))
+
+    def _maybe_update_roi_for_prompt(self, anchor_ijk):
+        """Decide whether to (re)establish ROI for a prompt at anchor_ijk.
+        Returns True if ROI state changed (caller's image_changed will pick it
+        up and trigger re-upload)."""
+        if anchor_ijk is None:
+            return False
+        if not self._should_use_roi_mode():
+            if self._roi_active:
+                self._reset_roi()
+                return True
+            return False
+
+        if self._roi_active and self._in_comfort_zone(anchor_ijk):
+            return False  # Prompt is inside the comfort zone; reuse current crop
+
+        new = self._compute_roi_for_center(anchor_ijk)
+        if new is None:
+            return False
+        start, shape = new
+        if (
+            self._roi_active
+            and self._roi_start_ijk == start
+            and self._roi_shape_ijk == shape
+        ):
+            return False
+        self._roi_active = True
+        self._roi_start_ijk = start
+        self._roi_shape_ijk = shape
+        logging.info(
+            f"ROI crop window: start_ijk={start}, shape_ijk={shape}, "
+            f"upload_shape_kji={tuple(shape[::-1])}"
+        )
+        self._refresh_roi_status_label()
+        return True
+
+    def _reset_roi(self):
+        """Reset ROI state so the next prompt establishes a fresh ROI."""
+        self._roi_active = False
+        self._roi_start_ijk = None
+        self._roi_shape_ijk = None
+        self._refresh_roi_status_label()
+
+    def _crop_for_roi(self, arr):
+        """arr is (K, J, I) numpy. Returns the native-resolution crop."""
+        i0, j0, k0 = self._roi_start_ijk
+        di, dj, dk = self._roi_shape_ijk
+        sub = arr[k0:k0 + dk, j0:j0 + dj, i0:i0 + di]
+        return np.ascontiguousarray(sub)
+
+    def _expected_server_shape(self):
+        """Numpy (K, J, I) shape the server will use for the active ROI."""
+        if not self._roi_active:
+            return None
+        di, dj, dk = self._roi_shape_ijk
+        return (dk, dj, di)
+
+    def _compute_max_zoom_out_factor(self):
+        """Compute (or fetch override) the autozoom cap to send to the server.
+        Based on spacing only — there is no client-side downsample."""
+        if self._roi_max_zoom_out_factor_override is not None:
+            return float(self._roi_max_zoom_out_factor_override)
+        spacing = self._volume_spacing_mm()
+        if spacing is None:
+            return None
+        min_spacing = min(spacing)
+        if min_spacing <= 0:
+            return None
+        factor = ROI_REFERENCE_SPACING_MM / min_spacing
+        factor = max(1.0, min(ROI_MAX_ZOOM_OUT_FACTOR_CAP, factor))
+        return float(np.ceil(factor))
+
+    def _composite_roi_mask_into_full(self, roi_mask):
+        """roi_mask is native-resolution, shape matches _roi_shape_ijk (KJI).
+        REPLACE the crop region of the full-volume segment with roi_mask;
+        voxels outside the crop region are left untouched."""
+        arr = self.get_image_data()
+        if arr is None:
+            return roi_mask
+        i0, j0, k0 = self._roi_start_ijk
+        di, dj, dk = self._roi_shape_ijk
+        # Make sure incoming mask is exactly the crop shape
+        roi_mask = roi_mask[:dk, :dj, :di]
+        existing = self.get_segment_data().astype(np.uint8)
+        if existing.shape != arr.shape:
+            existing = np.zeros(arr.shape, dtype=np.uint8)
+        existing[k0:k0 + dk, j0:j0 + dj, i0:i0 + di] = roi_mask.astype(np.uint8)
+        return existing
 
     ###############################################################################
     # Server communication and sync functions
@@ -1482,33 +1957,41 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def upload_image_to_server(self):
         """
         Gets volume data from Slicer, packs it, and uploads it to the server.
+        In ROI mode, sends only the native-resolution crop window around the
+        active prompt, plus max_zoom_out_factor for the server's autozoom.
         """
         logging.debug("Syncing image with server...")
         try:
-            # Retrieve image data, window, and level.
             t0 = time.time()
-            image_data = (
-                self.get_image_data()
-            )  # Expected to return (image_data, window, level)
+            image_data = self.get_image_data()
             logging.debug(f"self.get_image_data took {time.time() - t0}")
 
             if image_data is None:
                 logging.debug("No image data available to upload.")
                 return
 
-            t0 = time.time()
-            url = (
-                f"{self.server}/upload_image"  # Update this with your actual endpoint.
-            )
+            if self._roi_active:
+                upload_arr = self._crop_for_roi(image_data)
+                logging.info(
+                    f"ROI image upload: full shape {image_data.shape} -> "
+                    f"crop shape {upload_arr.shape} (native res)"
+                )
+            else:
+                upload_arr = image_data
+
+            url = f"{self.server}/upload_image"
 
             buffer = io.BytesIO()
-            np.save(buffer, image_data)
+            np.save(buffer, upload_arr)
             raw_data = buffer.getvalue()
             logging.debug(f"len(raw_data): {len(raw_data)}")
 
-            files = {"file": ("volume.npy", raw_data, "application/octet-stream")}
+            fields = {"file": ("volume.npy", raw_data, "application/octet-stream")}
+            mzof = self._compute_max_zoom_out_factor()
+            if mzof is not None:
+                fields["max_zoom_out_factor"] = str(mzof)
+                logging.info(f"Sending max_zoom_out_factor={mzof}")
 
-            # Create your MultipartEncoder without gzip headers
             from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 
             slicer.progress_window = slicer.util.createProgressDialog(autoClose=False)
@@ -1530,7 +2013,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 slicer.progress_window.setLabelText("Uploading image...")
                 slicer.app.processEvents()
 
-            encoder = MultipartEncoder(fields=files)
+            encoder = MultipartEncoder(fields=fields)
             monitor = MultipartEncoderMonitor(encoder, my_callback)
 
             try:
@@ -1546,21 +2029,34 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def upload_segment_to_server(self):
         """
-        Grabs current segmentation labelmap, gzips it, and sends it to the server.
+        Grabs current segmentation labelmap and uploads it. In ROI mode, crops
+        the segment to the same native-resolution window as the uploaded image.
+
+        Performance notes vs prior PR code:
+          - `.view(np.uint8)` instead of `.astype(np.uint8)` is zero-copy
+            (numpy bool is 1 byte) — saves a full-volume allocation that on a
+            multi-GB segment was costing seconds.
+          - Skip gzip entirely. On localhost there is no bandwidth reason to
+            compress, and gzip on a 134 MB cropped mask costs ~1-2 s per upload.
         """
         logging.debug("Syncing segment with server...")
         try:
-            segment_data = self.get_segment_data()
-            files = self.mask_to_np_upload_file(segment_data)
-            url = f"{self.server}/upload_segment"  # Update this with your actual endpoint.
+            segment_data = self.get_segment_data()  # bool, full-volume
+            if self._roi_active:
+                segment_data = self._crop_for_roi(segment_data.view(np.uint8))
+                logging.info(f"ROI segment upload shape: {segment_data.shape}")
+            else:
+                segment_data = segment_data.view(np.uint8)
 
-            result = self.request_to_server(
-                url, files=files, headers={"Content-Encoding": "gzip"}
-            )
+            buffer = io.BytesIO()
+            np.save(buffer, segment_data)
+            files = {"file": ("volume.npy", buffer.getvalue(), "application/octet-stream")}
 
+            url = f"{self.server}/upload_segment"
+            result = self.request_to_server(url, files=files)
             return result
         except Exception as e:
-            logging.debug(f"Error in upload_image_to_server: {e}")
+            logging.debug(f"Error in upload_segment_to_server: {e}")
 
     ###############################################################################
     # Utility / converters functions
@@ -1596,23 +2092,32 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def image_changed(self, do_prev_image_update=True):
         """
-        Checks if the volume's voxel data changed since the last time we stored it.
+        Returns True when the server needs a (re-)uploaded image. Uses an O(1)
+        signature: (volume node identity, VTK MTime, ROI window, zoom factor).
+        No byte-level array comparison — the previous full-volume `np.array_equal`
+        + `copy.deepcopy` cost seconds per prompt on multi-GB volumes for zero
+        benefit; Slicer/VTK bumps MTime on every modification.
         """
-        image_data = self.get_image_data()
-        if image_data is None:
+        vol_node = self.get_volume_node()
+        if vol_node is None:
             logging.debug("No volume node found")
             return
 
-        old_image_data = self.previous_states.get("image_data", None)
-
-        image_changed = old_image_data is None or not np.array_equal(
-            old_image_data, image_data
+        sig = (
+            id(vol_node),
+            int(vol_node.GetMTime()),
+            self._roi_active,
+            self._roi_start_ijk,
+            self._roi_shape_ijk,
+            self._compute_max_zoom_out_factor(),
         )
+        last_sig = self.previous_states.get("upload_sig", None)
+        changed = last_sig != sig
 
         if do_prev_image_update:
-            self.previous_states["image_data"] = copy.deepcopy(image_data)
+            self.previous_states["upload_sig"] = sig
 
-        return image_changed
+        return changed
 
     def mask_to_np_upload_file(self, mask):
         """
@@ -1626,18 +2131,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         return files
 
-    def unpack_binary_segmentation(self, binary_data, decompress=False):
+    def unpack_binary_segmentation(self, binary_data, decompress=False, vol_shape=None):
         """
-        Unpacks data received from server into a full 3D numpy array (bool).
+        Unpacks data received from server into a 3D numpy array (uint8 0/1).
+        If vol_shape is None, infers from the current volume node (legacy path).
+        In ROI mode, callers pass the expected crop-window shape.
         """
         if decompress:
-            binary_data = binary_data = gzip.decompress(binary_data)
+            binary_data = gzip.decompress(binary_data)
 
-        if self.get_image_data() is None:
-            self.capture_image()
+        if vol_shape is None:
+            if self.get_image_data() is None:
+                self.capture_image()
+            vol_shape = self.get_image_data().shape
 
-        vol_shape = self.get_image_data().shape
-        total_voxels = np.prod(vol_shape)
+        total_voxels = int(np.prod(vol_shape))
         unpacked_bits = np.unpackbits(np.frombuffer(binary_data, dtype=np.uint8))
         unpacked_bits = unpacked_bits[:total_voxels]
 
